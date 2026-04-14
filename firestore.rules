@@ -1,0 +1,266 @@
+/**
+ * Core Philosophy: This ruleset enforces a security model with three distinct access tiers:
+ * 1.  Private User Data: All information unique to a user (profile, recommendation history) is strictly confined to their own data tree, accessible only by them.
+ * 2.  Public Global Data: Core application content (media items, mood archetypes) is publicly readable by anyone but can only be modified by designated administrators.
+ * 3.  Shared User-Generated Content: Content created by users but intended for public viewing (like reviews) is publicly readable, but write access (create, update, delete) is restricted to the original author.
+ *
+ * Data Structure: The data is organized into top-level collections for global data (`mediaItems`, `moodArchetypes`) and private user data (`users`). User-specific subcollections (`recommendationSessions`) are nested under `/users/{userId}` to enforce ownership through path hierarchy. Public user-generated content (`reviews`) is nested under the content it relates to (e.g., `/mediaItems/{mediaItemId}/reviews/{reviewId}`) for easy querying.
+ *
+ * Key Security Decisions:
+ * -   User data is strictly isolated; users cannot read or even list other users' profiles or private data.
+ * -   Administrator privileges are managed by the existence of a document in a dedicated `/roles_admin/{userId}` collection. This provides a clear, queryable source of truth for admin status.
+ * -   Reviews are nested under the media they belong to, enabling public queries for all reviews of an item while still securing write operations to the review's author.
+ * -   Subscription status (`subscriptionStatus`) is protected. Users can only be created with a 'free' status, and for this demo, can upgrade to 'pro'. In a real app, this should be controlled by a secure backend.
+ *
+ * Denormalization for Authorization: To ensure fast and secure authorization checks, ownership data is denormalized. For example, a `Review` document under `/mediaItems/{mediaItemId}/reviews/{reviewId}` contains a `userId` field. This allows write-access rules to directly check `resource.data.userId == request.auth.uid` without performing slow and costly `get()` calls to other documents.
+ *
+ * Structural Segregation: Each collection has a distinct and uniform security purpose. Private data is kept entirely separate from public data, which simplifies the rules for `list` operations and prevents accidental data leakage. For instance, `/users/{userId}/recommendationSessions` is private, while `/mediaItems` is public, avoiding the need for complex, query-based rules within a single collection.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------------
+    // Helper Functions
+    // -------------------------------------------------------------------------
+
+    /**
+     * Checks if a user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the currently authenticated user is the owner of a document,
+     * based on a matching userId in the path.
+     */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /**
+     * Checks if the currently authenticated user is the owner of an *existing* document.
+     * Crucial for secure update and delete operations.
+     */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && resource != null;
+    }
+
+    /**
+     * Checks if the currently authenticated user is an administrator.
+     * Admin status is granted by the existence of a document in the /roles_admin collection.
+     */
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/roles_admin/$(request.auth.uid));
+    }
+
+    /**
+     * On create, validates that the new user profile's internal `id` field
+     * matches the document's ID (which is the user's auth UID) and that the
+     * subscription status is set to 'free'.
+     */
+    function newProfileDataIsValid(userId) {
+      return request.resource.data.id == userId
+          && request.resource.data.subscriptionStatus == 'free';
+    }
+
+    /**
+     * On update, ensures the user profile's internal `id` field is immutable
+     * and that subscription status changes are valid.
+     */
+    function existingProfileDataIsValid() {
+      return request.resource.data.id == resource.data.id
+          && subscriptionChangeIsValid();
+    }
+    
+    /**
+     * FOR DEMONSTRATION PURPOSES: This rule allows a user to upgrade themselves
+     * from 'free' to 'pro'. In a real-world application, this logic MUST be
+     * handled by a secure backend process (e.g., a Cloud Function triggered by
+     * a payment provider like Stripe) that verifies payment before updating the status.
+     * A user should never be allowed to change their own subscription status directly.
+     */
+    function subscriptionChangeIsValid() {
+      // Check if subscriptionStatus exists on the old resource, default to 'free'
+      let oldStatus = 'subscriptionStatus' in resource.data ? resource.data.subscriptionStatus : 'free';
+      let newStatus = request.resource.data.subscriptionStatus;
+
+      // A user can upgrade from 'free' to 'pro' for this demo.
+      // They cannot downgrade from 'pro' to 'free'.
+      // The status can also remain unchanged.
+      let isUpgrading = oldStatus == 'free' && newStatus == 'pro';
+      let isUnchanged = oldStatus == newStatus;
+
+      return isUpgrading || isUnchanged || isAdmin();
+    }
+    
+    /**
+     * On create, validates that a new session's internal `userId`
+     * matches the owner's UID from the path.
+     */
+    function newSessionDataIsValid(userId) {
+      return request.resource.data.userId == userId;
+    }
+
+    /**
+     * On update, ensures the session's internal `userId` is immutable.
+     */
+    function existingSessionDataIsValid() {
+      return request.resource.data.userId == resource.data.userId;
+    }
+
+    /**
+     * On create, validates that a new detail's `recommendationSessionId`
+     * matches the session's ID from the path.
+     */
+    function newDetailDataIsValid(sessionId) {
+      return request.resource.data.recommendationSessionId == sessionId;
+    }
+    
+    /**
+     * On update, ensures the detail's internal `recommendationSessionId` is immutable.
+     */
+    function existingDetailDataIsValid() {
+      return request.resource.data.recommendationSessionId == resource.data.recommendationSessionId;
+    }
+    
+    /**
+     * On create, validates a new review's ownership and path relationship.
+     */
+    function newReviewDataIsValid(mediaItemId) {
+      return request.resource.data.userId == request.auth.uid
+        && request.resource.data.mediaItemId == mediaItemId;
+    }
+
+    /**
+     * On update, ensures a review's core relational fields are immutable.
+     */
+    function existingReviewDataIsValid() {
+      return request.resource.data.userId == resource.data.userId
+        && request.resource.data.mediaItemId == resource.data.mediaItemId;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection Rules
+    // -------------------------------------------------------------------------
+
+    /**
+     * @description Controls access to user profiles. Users can create, read, and update their own profile, but cannot see or list others.
+     * @path /users/{userId}
+     * @allow (create) An authenticated user with UID 'user123' creating their own profile at `/users/user123`.
+     * @deny (get) User 'user123' trying to read the profile at `/users/user456`.
+     * @principle Restricts access to a user's own data tree.
+     */
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false;
+      allow create: if isOwner(userId) && newProfileDataIsValid(userId);
+      allow update: if isExistingOwner(userId) && existingProfileDataIsValid();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Controls access to predefined mood archetypes. This data is public for all to read but writable only by administrators.
+     * @path /moodArchetypes/{moodId}
+     * @allow (get) Any user, signed in or not, reading a document at `/moodArchetypes/adventure`.
+     * @deny (create) A non-admin user trying to create a new mood archetype.
+     * @principle Segregates public read-only data from protected write operations.
+     */
+    match /moodArchetypes/{moodId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isAdmin();
+      allow update: if isAdmin() && resource != null;
+      allow delete: if isAdmin() && resource != null;
+    }
+
+    /**
+     * @description Controls access to media items (books, movies, etc.). This data is public for all to read but writable only by administrators.
+     * @path /mediaItems/{mediaItemId}
+     * @allow (list) Any user, signed in or not, listing all documents in the `mediaItems` collection.
+     * @deny (update) A non-admin user trying to change the title of a movie.
+     * @principle Segregates public read-only data from protected write operations.
+     */
+    match /mediaItems/{mediaItemId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isAdmin();
+      allow update: if isAdmin() && resource != null;
+      allow delete: if isAdmin() && resource != null;
+    }
+
+    /**
+     * @description Controls access to a user's recommendation session history. Only the user who owns the session can access it.
+     * @path /users/{userId}/recommendationSessions/{sessionId}
+     * @allow (list) User 'user123' listing their own past sessions at `/users/user123/recommendationSessions`.
+     * @deny (get) User 'user456' trying to read a session at `/users/user123/recommendationSessions/sessionABC`.
+     * @principle Enforces strict ownership on nested user-private data.
+     */
+    match /users/{userId}/recommendationSessions/{sessionId} {
+      allow get: if isOwner(userId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) && newSessionDataIsValid(userId);
+      allow update: if isExistingOwner(userId) && existingSessionDataIsValid();
+      allow delete: if isExistingOwner(userId);
+    }
+    
+    /**
+     * @description Controls access to a user's recommendation history. This is a premium feature, access is private to the user.
+     * @path /users/{userId}/recommendationHistory/{historyId}
+     * @allow (list) User 'user123' listing their own history at `/users/user123/recommendationHistory`.
+     * @deny (get) User 'user456' trying to read history at `/users/user123/recommendationHistory/historyABC`.
+     * @principle Enforces strict ownership on nested user-private data.
+     */
+    match /users/{userId}/recommendationHistory/{historyId} {
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId);
+        allow update, delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Controls access to the detailed explanations within a recommendation session. Access is inherited from the parent session.
+     * @path /users/{userId}/recommendationSessions/{sessionId}/recommendationDetails/{detailId}
+     * @allow (create) User 'user123' creating a new detail document within their own session.
+     * @deny (update) User 'user456' trying to update a detail within user 'user123's session.
+     * @principle Enforces strict ownership inherited from the parent document's path.
+     */
+    match /users/{userId}/recommendationSessions/{sessionId}/recommendationDetails/{detailId} {
+      allow get: if isOwner(userId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) && newDetailDataIsValid(sessionId);
+      allow update: if isExistingOwner(userId) && existingDetailDataIsValid();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Controls access to user-submitted reviews. Reviews are public to read but can only be written or modified by their original author.
+     * @path /mediaItems/{mediaItemId}/reviews/{reviewId}
+     * @allow (list) Any user listing all reviews for a given media item.
+     * @deny (delete) User 'user456' trying to delete a review written by 'user123'.
+     * @principle Enforces document ownership for writes on a publicly readable collection.
+     */
+    match /mediaItems/{mediaItemId}/reviews/{reviewId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isSignedIn() && newReviewDataIsValid(mediaItemId);
+      allow update: if isExistingOwner(resource.data.userId) && existingReviewDataIsValid();
+      allow delete: if isExistingOwner(resource.data.userId);
+    }
+
+    /**
+     * @description Manages administrator roles. Only existing admins can read or modify this collection. Listing is disabled for security.
+     * @path /roles_admin/{userId}
+     * @allow (create) An existing admin granting another user admin rights by creating a document at `/roles_admin/newUserUID`.
+     * @deny (get) A non-admin user trying to check if another user is an admin.
+     * @principle Restricts high-privilege operations to a specific role (admin).
+     */
+    match /roles_admin/{userId} {
+      allow get: if isAdmin();
+      allow list: if false;
+      allow create: if isAdmin();
+      allow update: if isAdmin() && resource != null;
+      allow delete: if isAdmin() && resource != null;
+    }
+  }
+}

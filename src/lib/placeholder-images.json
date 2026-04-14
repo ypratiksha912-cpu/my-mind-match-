@@ -1,0 +1,34 @@
+{
+  "placeholderImages": [
+    {
+      "id": "1",
+      "description": "Abstract book cover with geometric shapes",
+      "imageUrl": "https://picsum.photos/seed/book1/400/600",
+      "imageHint": "abstract geometric"
+    },
+    {
+      "id": "2",
+      "description": "Book cover with a serene landscape",
+      "imageUrl": "https://picsum.photos/seed/book2/400/600",
+      "imageHint": "serene landscape"
+    },
+    {
+      "id": "3",
+      "description": "Book cover featuring a mysterious forest path",
+      "imageUrl": "https://picsum.photos/seed/book3/400/600",
+      "imageHint": "mysterious forest"
+    },
+    {
+      "id": "4",
+      "description": "A vibrant and colorful book cover design",
+      "imageUrl": "https://picsum.photos/seed/book4/400/600",
+      "imageHint": "vibrant colorful"
+    },
+    {
+      "id": "5",
+      "description": "Minimalist book cover with a single object",
+      "imageUrl": "https://picsum.photos/seed/book5/400/600",
+      "imageHint": "minimalist object"
+    }
+  ]
+}
