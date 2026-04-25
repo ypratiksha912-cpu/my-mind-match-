@@ -166,8 +166,8 @@ export function LoginForm() {
     setIsLoading(true);
     try {
       const provider = new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
-      handleAuthSuccess(result.user, 'signin');
+     await signInWithRedirect(auth, provider);
+      
     } catch (error: any) {
       handleAuthError(error, 'google');
     } finally {
