@@ -4,7 +4,8 @@ import * as React from 'react';
 import { useRouter } from 'next/navigation';
 import {
   GoogleAuthProvider,
-  signInWithPopup,
+  signInWithRedirect,
+getRedirectResult,
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
   type User,
